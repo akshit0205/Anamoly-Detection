@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="760" viewBox="0 0 1400 760">
+  <style>
+    .title { font: bold 20px "Segoe UI", Arial; fill:#0b3d91; }
+    .subtitle { font: 14px "Segoe UI", Arial; fill:#1f4e79;}
+    .box { fill:#ffffff; stroke:#2b6cb0; stroke-width:2; rx:10; ry:10; }
+    .cloud { fill:#e8f0ff; stroke:#5484c3; stroke-width:2; rx:18; ry:18; }
+    .text { font: 13px "Segoe UI", Arial; fill:#073763; }
+    .small { font: 11px "Segoe UI", Arial; fill:#073763; }
+    .arrow { stroke:#2b6cb0; stroke-width:3; fill:none; marker-end:url(#arrowhead); }
+    .phase { fill:#f4f8ff; stroke:#c7def6; stroke-width:1; rx:6; ry:6; }
+    .note { font: 12px "Segoe UI", Arial; fill:#08305a; }
+  </style>
+
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="10" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#2b6cb0"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="30" y="36" class="title">AI-Driven Cloud Monitoring and Threat Detection — Architecture</text>
+  <text x="30" y="58" class="subtitle">Phase-1 (Local Prototype) and Phase-2/3 (Cloud Target Architecture)</text>
+
+  <!-- Phase 1 Box -->
+  <rect x="20" y="82" width="410" height="220" class="phase"/>
+  <text x="40" y="108" class="small">Phase-1 — Local Proof of Concept</text>
+
+  <!-- logs.json -->
+  <rect x="40" y="128" width="140" height="70" class="box"/>
+  <text x="50" y="150" class="text">logs.json</text>
+  <text x="50" y="168" class="small">Local CloudTrail-style logs</text>
+
+  <!-- model.py -->
+  <rect x="210" y="128" width="180" height="70" class="box"/>
+  <text x="224" y="150" class="text">model.py</text>
+  <text x="224" y="168" class="small">Isolation Forest ML model</text>
+
+  <!-- streamlit -->
+  <rect x="120" y="210" width="180" height="70" class="box"/>
+  <text x="132" y="232" class="text">Streamlit Dashboard</text>
+  <text x="132" y="250" class="small">Shows anomalies</text>
+
+  <!-- Phase-1 Arrows -->
+  <path d="M180 165 L210 165" class="arrow"/>
+  <path d="M300 165 L300 210" class="arrow"/>
+  <path d="M200 210 L180 210" class="arrow"/>
+
+  <!-- Separator -->
+  <line x1="450" y1="82" x2="450" y2="700" stroke="#d0e5ff" stroke-width="2"/>
+
+  <!-- Phase 2/3 Cloud Section -->
+  <text x="480" y="108" class="small" fill="#0b3d91">Phase-2 and Phase-3 — Cloud Architecture (Final Goal)</text>
+
+  <!-- CloudTrail -->
+  <g transform="translate(480,120)">
+    <rect width="180" height="80" class="cloud"/>
+    <text x="12" y="28" class="text">CloudTrail</text>
+    <text x="12" y="46" class="small">AWS activity logs</text>
+  </g>
+
+  <!-- S3 -->
+  <g transform="translate(700,120)">
+    <rect width="200" height="80" class="box"/>
+    <text x="12" y="28" class="text">Amazon S3</text>
+    <text x="12" y="46" class="small">Security Data Lake</text>
+  </g>
+
+  <!-- Arrow -->
+  <path d="M660 160 L700 160" class="arrow"/>
+
+  <!-- MSK -->
+  <g transform="translate(480,220)">
+    <rect width="180" height="80" class="box"/>
+    <text x="12" y="28" class="text">MSK (Kafka)</text>
+    <text x="12" y="46" class="small">Real-time ingestion</text>
+  </g>
+
+  <!-- Stream Processing -->
+  <g transform="translate(700,220)">
+    <rect width="220" height="80" class="box"/>
+    <text x="12" y="28" class="text">Stream Processing</text>
+    <text x="12" y="46" class="small">Lambda or Spark Streaming</text>
+  </g>
+
+  <path d="M660 260 L700 260" class="arrow"/>
+
+  <!-- Feature Store -->
+  <g transform="translate(960,220)">
+    <rect width="200" height="80" class="box"/>
+    <text x="12" y="28" class="text">Feature Store</text>
+    <text x="12" y="46" class="small">Processed log features</text>
+  </g>
+
+  <path d="M920 260 L960 260" class="arrow"/>
+
+  <!-- SageMaker -->
+  <g transform="translate(480,340)">
+    <rect width="280" height="110" class="cloud"/>
+    <text x="12" y="28" class="text">SageMaker</text>
+    <text x="12" y="52" class="small">Model Hosting: IF, Autoencoder, LSTM, XGBoost</text>
+    <text x="12" y="72" class="small">Versioning and endpoints</text>
+  </g>
+
+  <!-- SageMaker arrow from Feature Store -->
+  <path d="M1160 260 L1160 340 L760 340" class="arrow"/>
+
+  <!-- Dashboard -->
+  <g transform="translate(800,480)">
+    <rect width="260" height="90" class="box"/>
+    <text x="12" y="26" class="text">Dashboards</text>
+    <text x="12" y="46" class="small">OpenSearch, Grafana, Streamlit</text>
+  </g>
+
+  <!-- Arrow -->
+  <path d="M560 390 L840 480" class="arrow"/>
+
+  <!-- SOAR -->
+  <g transform="translate(1100,480)">
+    <rect width="220" height="90" class="box"/>
+    <text x="12" y="26" class="text">SOAR Automation</text>
+    <text x="12" y="46" class="small">Auto-block IPs, isolate IAM users</text>
+  </g>
+
+  <path d="M1060 540 L1100 540" class="arrow"/>
+
+  <!-- CloudTrail 90-day note -->
+  <rect x="20" y="520" width="410" height="200" rx="8" ry="8" fill="#fff8e6" stroke="#e6c36b"/>
+  <text x="36" y="548" class="small" fill="#7a4b00">About CloudTrail Free Tier</text>
+  <text x="36" y="570" class="small">- CloudTrail stores activity logs for 90 days for free.</text>
+  <text x="36" y="590" class="small">- Enabling now would waste the free window before Phase-2.</text>
+  <text x="36" y="610" class="small">- Therefore CloudTrail will be enabled later during development.</text>
+
+  <text x="30" y="740" class="small">SVG Architecture Diagram — Copy into PPT | Phase-1 Local + Phase-2/3 Cloud Integration</text>
+</svg>
