@@ -16,6 +16,7 @@ def assume_role(role_arn, session_name='CloudTrailAnomalySession', region=None) 
         session_name = 'CloudTrailAnomalySession'
 
     try:
+        logger.info('ASSUME_ROLE_START', extra={'role_arn': role_arn, 'region': region})
         sts_client = boto3.client('sts', region_name=region)
         response = sts_client.assume_role(RoleArn=role_arn, RoleSessionName=session_name)
         creds = response.get('Credentials', {})
@@ -27,16 +28,16 @@ def assume_role(role_arn, session_name='CloudTrailAnomalySession', region=None) 
         }
 
         if not all(mapped.values()):
-            logger.error('STS assume_role returned incomplete credentials for role_arn=%s', role_arn)
+            logger.error('ASSUME_ROLE_FAILED', extra={'role_arn': role_arn, 'reason': 'incomplete_credentials'})
             raise RuntimeError('Failed to assume role: STS returned incomplete credentials')
 
-        logger.info('Successfully assumed role: %s', role_arn)
+        logger.info('ASSUME_ROLE_SUCCESS', extra={'role_arn': role_arn})
         return mapped
     except ClientError as exc:
-        logger.error('ClientError while assuming role %s: %s', role_arn, exc)
+        logger.error('ASSUME_ROLE_FAILED', extra={'role_arn': role_arn, 'error': str(exc)})
         raise RuntimeError(f'Failed to assume role due to AWS client error: {exc}') from exc
     except BotoCoreError as exc:
-        logger.error('BotoCoreError while assuming role %s: %s', role_arn, exc)
+        logger.error('ASSUME_ROLE_FAILED', extra={'role_arn': role_arn, 'error': str(exc)})
         raise RuntimeError(f'Failed to assume role due to boto core error: {exc}') from exc
 
 
@@ -49,10 +50,12 @@ def get_client_for_role(service, role_arn, region):
         raise ValueError('region')
 
     try:
+        logger.info('GET_CLIENT_FOR_ROLE_START', extra={'service': service, 'role_arn': role_arn, 'region': region})
         creds = assume_role(role_arn=role_arn, session_name='CloudTrailAnomalySession', region=region)
     except RuntimeError:
         raise
 
+    logger.info('GET_CLIENT_FOR_ROLE_SUCCESS', extra={'service': service, 'role_arn': role_arn, 'region': region})
     return boto3.client(
         service,
         region_name=region,

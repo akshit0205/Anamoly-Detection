@@ -2,6 +2,7 @@ import gzip
 import json
 import logging
 from io import BytesIO
+from datetime import datetime, timezone
 
 from botocore.exceptions import BotoCoreError, ClientError
 
@@ -21,9 +22,15 @@ REQUIRED_USER_FIELDS = (
 
 
 def _is_sensitive_api(event_name: str) -> bool:
-    if not event_name:
-        return False
-    return event_name.startswith('Delete') or event_name.startswith('Stop') or event_name.startswith('Terminate')
+    sensitive = [
+        'DeleteGroup', 'DeleteUser', 'DeleteRole', 'DeletePolicy',
+        'CreateUser', 'CreateRole', 'AttachRolePolicy', 'DetachRolePolicy',
+        'PutRolePolicy', 'AddUserToGroup', 'RemoveUserFromGroup',
+        'StopInstances', 'TerminateInstances', 'DeleteBucket',
+        'AssumeRole', 'ConsoleLogin', 'AuthorizeSecurityGroupIngress',
+        'DeleteTrail', 'StopLogging', 'UpdateTrail'
+    ]
+    return event_name in sensitive
 
 
 def _extract_username(record: dict) -> str:
@@ -71,21 +78,29 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
         return []
 
     account_id = user['account_id']
+    print(f"DEBUG: run_detection called for account_id={account_id}", flush=True)
     role_arn = user['role_arn']
     region = user['region']
     default_bucket = user['cloudtrail_bucket']
 
+    mode = 'single_object' if (bucket is not None and key is not None) else 'full_scan'
+    logger.info('RUN_DETECTION_START', extra={'account_id': account_id, 'bucket': bucket or default_bucket, 'mode': mode})
+    logger.info('MODE_SELECTED', extra={'mode': mode, 'account_id': account_id})
+
     try:
         s3_client = get_client_for_role('s3', role_arn, region)
     except RuntimeError as exc:
+        logger.error('STS_FAILURE', extra={'account_id': account_id, 'role_arn': role_arn, 'region': region})
         logger.error('Failed to create assumed-role S3 client for account_id=%s: %s', account_id, exc)
-        return []
+        raise RuntimeError(f'Failed to create assumed-role S3 client for account_id={account_id}') from exc
 
     anomalies = []
+    seen_events = set()
 
     try:
         if bucket is not None and key is not None:
             try:
+                logger.info('S3_OBJECT_READ', extra={'bucket': bucket, 'key': key})
                 response = s3_client.get_object(Bucket=bucket, Key=key)
                 body = response['Body'].read()
             except ClientError as exc:
@@ -97,12 +112,17 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
 
             if body:
                 records = _parse_log_body(key, body)
-                if records is not None:
+                if records is None:
+                    logger.warning('PARSE_FAILED', extra={'bucket': bucket, 'key': key})
+                else:
+                    logger.info('PARSE_COUNT', extra={'bucket': bucket, 'key': key, 'record_count': len(records)})
                     for record in records:
                         if not isinstance(record, dict):
                             continue
 
                         event_name = record.get('eventName', '')
+                        print(f"DEBUG: event={event_name} user={_extract_username(record)} error={record.get('errorCode')} root={(record.get('userIdentity', {}) or {}).get('type') == 'Root'}", flush=True)
+                        logger.debug('EVENT_SEEN', extra={'account_id': account_id, 'event_name': event_name})
                         username = _extract_username(record)
                         timestamp = record.get('eventTime', '')
                         identity = record.get('userIdentity', {})
@@ -112,42 +132,69 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                         reasons = []
                         if is_root:
                             reasons.append('Root account usage detected')
+                            logger.info('ANOMALY_DETECTED', extra={'account_id': account_id, 'event_name': event_name, 'rule': 'Root'})
                         if _is_sensitive_api(event_name):
                             reasons.append(f'Sensitive API call detected: {event_name}')
+                            logger.info('ANOMALY_DETECTED', extra={'account_id': account_id, 'event_name': event_name, 'rule': 'SensitiveAPI'})
                         if error_code == 'AccessDenied':
                             reasons.append('AccessDenied error detected')
+                            logger.info('ANOMALY_DETECTED', extra={'account_id': account_id, 'event_name': event_name, 'rule': 'AccessDenied'})
 
                         for reason in reasons:
-                            anomalies.append(
-                                {
-                                    'account_id': account_id,
-                                    'event_name': event_name or 'Unknown',
-                                    'username': username,
-                                    'reason': reason,
-                                    'timestamp': timestamp,
-                                }
-                            )
+                            dedup_key = f"{event_name}:{username}:{error_code}"
+                            if dedup_key not in seen_events:
+                                seen_events.add(dedup_key)
+                                anomalies.append(
+                                    {
+                                        'account_id': account_id,
+                                        'event_name': event_name or 'Unknown',
+                                        'username': username,
+                                        'reason': reason,
+                                        'timestamp': timestamp,
+                                    }
+                                )
             else:
                 logger.warning('Skipping empty CloudTrail object s3://%s/%s', bucket, key)
         else:
             paginator = s3_client.get_paginator('list_objects_v2')
-            page_iter = paginator.paginate(Bucket=default_bucket)
+            logger.info('S3_LIST_START', extra={'bucket': default_bucket})
+            today = datetime.now(timezone.utc)
+            prefix = (
+                f"AWSLogs/{account_id}/CloudTrail/{region}/"
+                f"{today.year}/{today.month:02d}/{today.day:02d}/"
+            )
+            print(f"DEBUG: scanning prefix={prefix}", flush=True)
+            page_iter = paginator.paginate(
+                Bucket=default_bucket,
+                Prefix=prefix,
+                PaginationConfig={"MaxItems": 20}
+            )
+            total_objects = 0
+            files_processed = 0
+            MAX_FILES = 50
 
             for page in page_iter:
-                for obj in page.get('Contents', []):
+                objs = page.get('Contents', [])
+                logger.info('S3_PAGE', extra={'bucket': default_bucket, 'objects_in_page': len(objs)})
+                total_objects += len(objs)
+                for obj in objs:
+                    if files_processed >= MAX_FILES:
+                        break
+
                     key = obj.get('Key')
                     if not key:
                         continue
 
                     try:
+                        logger.info('S3_OBJECT_READ', extra={'bucket': default_bucket, 'key': key})
                         response = s3_client.get_object(Bucket=default_bucket, Key=key)
                         body = response['Body'].read()
                     except ClientError as exc:
                         logger.error('ClientError fetching s3://%s/%s: %s', default_bucket, key, exc)
-                        continue
+                        raise RuntimeError(f'Failed to fetch s3://{default_bucket}/{key}') from exc
                     except BotoCoreError as exc:
                         logger.error('BotoCoreError fetching s3://%s/%s: %s', default_bucket, key, exc)
-                        continue
+                        raise RuntimeError(f'Failed to fetch s3://{default_bucket}/{key}') from exc
 
                     if not body:
                         logger.warning('Skipping empty CloudTrail object s3://%s/%s', default_bucket, key)
@@ -155,13 +202,20 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
 
                     records = _parse_log_body(key, body)
                     if records is None:
+                        logger.warning('PARSE_FAILED', extra={'bucket': default_bucket, 'key': key})
                         continue
+                    if isinstance(records, list) and len(records) == 0:
+                        logger.info('NO_RECORDS', extra={'bucket': default_bucket, 'key': key})
+                        continue
+                    logger.info('PARSE_COUNT', extra={'bucket': default_bucket, 'key': key, 'record_count': len(records)})
 
                     for record in records:
                         if not isinstance(record, dict):
                             continue
 
                         event_name = record.get('eventName', '')
+                        print(f"DEBUG: event={event_name} user={_extract_username(record)} error={record.get('errorCode')} root={(record.get('userIdentity', {}) or {}).get('type') == 'Root'}", flush=True)
+                        logger.debug('EVENT_SEEN', extra={'account_id': account_id, 'event_name': event_name})
                         username = _extract_username(record)
                         timestamp = record.get('eventTime', '')
                         identity = record.get('userIdentity', {})
@@ -171,26 +225,37 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                         reasons = []
                         if is_root:
                             reasons.append('Root account usage detected')
+                            logger.info('ANOMALY_DETECTED', extra={'account_id': account_id, 'event_name': event_name, 'rule': 'Root'})
                         if _is_sensitive_api(event_name):
                             reasons.append(f'Sensitive API call detected: {event_name}')
+                            logger.info('ANOMALY_DETECTED', extra={'account_id': account_id, 'event_name': event_name, 'rule': 'SensitiveAPI'})
                         if error_code == 'AccessDenied':
                             reasons.append('AccessDenied error detected')
+                            logger.info('ANOMALY_DETECTED', extra={'account_id': account_id, 'event_name': event_name, 'rule': 'AccessDenied'})
 
                         for reason in reasons:
-                            anomalies.append(
-                                {
-                                    'account_id': account_id,
-                                    'event_name': event_name or 'Unknown',
-                                    'username': username,
-                                    'reason': reason,
-                                    'timestamp': timestamp,
-                                }
-                            )
+                            dedup_key = f"{event_name}:{username}:{error_code}"
+                            if dedup_key not in seen_events:
+                                seen_events.add(dedup_key)
+                                anomalies.append(
+                                    {
+                                        'account_id': account_id,
+                                        'event_name': event_name or 'Unknown',
+                                        'username': username,
+                                        'reason': reason,
+                                        'timestamp': timestamp,
+                                    }
+                                )
+                    files_processed += 1
+            print(f"DEBUG: total_objects={total_objects}", flush=True)
+            logger.info('S3_LIST_COMPLETE', extra={'bucket': default_bucket, 'total_objects': total_objects})
 
     except ClientError as exc:
+        logger.error('TOP_LEVEL_EXCEPTION', extra={'error': str(exc)})
         logger.error('ClientError listing CloudTrail logs for bucket=%s account_id=%s: %s', default_bucket, account_id, exc)
         raise RuntimeError(f'Failed to list CloudTrail logs for bucket={default_bucket}') from exc
     except BotoCoreError as exc:
+        logger.error('TOP_LEVEL_EXCEPTION', extra={'error': str(exc)})
         logger.error('BotoCoreError listing CloudTrail logs for bucket=%s account_id=%s: %s', default_bucket, account_id, exc)
         raise RuntimeError(f'Failed to list CloudTrail logs for bucket={default_bucket}') from exc
 

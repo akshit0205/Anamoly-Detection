@@ -13,6 +13,14 @@ from storage.dynamodb_store import get_user, list_users, save_user
 
 logger = logging.getLogger(__name__)
 app = FastAPI()
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _storage_region() -> str:
