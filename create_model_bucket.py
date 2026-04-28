@@ -1,5 +1,12 @@
-import boto3
-from botocore.exceptions import ClientError
+import argparse
+import logging
+from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
+from config.config_loader import AwsOperationError, aws_client, safe_aws_call
+
+
+LOGGER = logging.getLogger(__name__)
+
+
 def create_model_bucket(bucket_name, region='us-east-1'):
     """
     Create an S3 bucket for storing ML models.
@@ -11,17 +18,18 @@ def create_model_bucket(bucket_name, region='us-east-1'):
     Returns:
         bool: True if successful
     """
-    s3_client = boto3.client('s3', region_name=region)
-    
     try:
+        s3_client = aws_client('s3', region)
         # Step 1: Create S3 Bucket
         print(f"Creating S3 bucket: {bucket_name}")
         
         try:
             if region == 'us-east-1':
-                s3_client.create_bucket(Bucket=bucket_name)
+                safe_aws_call('create model bucket', s3_client.create_bucket, Bucket=bucket_name)
             else:
-                s3_client.create_bucket(
+                safe_aws_call(
+                    'create model bucket with region constraint',
+                    s3_client.create_bucket,
                     Bucket=bucket_name,
                     CreateBucketConfiguration={'LocationConstraint': region}
                 )
@@ -34,7 +42,9 @@ def create_model_bucket(bucket_name, region='us-east-1'):
         
         # Step 2: Enable Server-Side Encryption
         print("Enabling server-side encryption...")
-        s3_client.put_bucket_encryption(
+        safe_aws_call(
+            'enable model bucket encryption',
+            s3_client.put_bucket_encryption,
             Bucket=bucket_name,
             ServerSideEncryptionConfiguration={
                 'Rules': [{
@@ -49,7 +59,9 @@ def create_model_bucket(bucket_name, region='us-east-1'):
         
         # Step 3: Block Public Access
         print("Blocking public access...")
-        s3_client.put_public_access_block(
+        safe_aws_call(
+            'block model bucket public access',
+            s3_client.put_public_access_block,
             Bucket=bucket_name,
             PublicAccessBlockConfiguration={
                 'BlockPublicAcls': True,
@@ -62,7 +74,9 @@ def create_model_bucket(bucket_name, region='us-east-1'):
         
         # Step 4: Enable Versioning
         print("Enabling versioning...")
-        s3_client.put_bucket_versioning(
+        safe_aws_call(
+            'enable model bucket versioning',
+            s3_client.put_bucket_versioning,
             Bucket=bucket_name,
             VersioningConfiguration={'Status': 'Enabled'}
         )
@@ -78,13 +92,16 @@ def create_model_bucket(bucket_name, region='us-east-1'):
         
         return True
         
-    except ClientError as e:
+    except (ClientError, NoCredentialsError, PartialCredentialsError, AwsOperationError) as e:
+        LOGGER.error('Failed to create/configure model bucket: %s', e)
         print(f"[FAIL] Error: {e}")
         return False
 
 
 if __name__ == "__main__":
-    BUCKET_NAME = "akshit-ml-models-4679"
-    REGION = "us-east-1"
-    
-    create_model_bucket(BUCKET_NAME, REGION)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
+    parser = argparse.ArgumentParser(description='Create model bucket for anomaly model artifacts')
+    parser.add_argument('--model-bucket', required=True, help='Model S3 bucket name')
+    parser.add_argument('--region', required=True, help='AWS region')
+    args = parser.parse_args()
+    create_model_bucket(args.model_bucket, args.region)

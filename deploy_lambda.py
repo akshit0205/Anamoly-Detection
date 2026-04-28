@@ -1,23 +1,24 @@
-import boto3
+import argparse
 import json
 import zipfile
 import os
 import time
-from botocore.exceptions import ClientError
+import logging
+from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
+from config.config_loader import AwsOperationError, aws_client, safe_aws_call
 
 
-# Configuration
-LAMBDA_FUNCTION_NAME = "cloudtrail-anomaly-detector"
-LAMBDA_ROLE_NAME = "cloudtrail-anomaly-detector-role"
-MODEL_BUCKET = "akshit-ml-models-4679"
-CLOUDTRAIL_BUCKET = "akshit-cloudtrail-logs-4679"
-REGION = "us-east-1"
+LOGGER = logging.getLogger(__name__)
 
 
-def create_lambda_role():
+def _aws_error_code(exc):
+    if isinstance(exc, ClientError):
+        return exc.response.get('Error', {}).get('Code', '')
+    return ''
+
+
+def create_lambda_role(lambda_role_name, model_bucket, cloudtrail_bucket, region):
     """Create IAM role for Lambda function."""
-    iam = boto3.client('iam')
-    
     # Trust policy for Lambda
     trust_policy = {
         "Version": "2012-10-17",
@@ -44,12 +45,20 @@ def create_lambda_role():
             {
                 "Effect": "Allow",
                 "Action": [
-                    "s3:GetObject",
+                    "s3:GetObject"
+                ],
+                "Resource": [
+                    f"arn:aws:s3:::{model_bucket}/models/*",
+                    f"arn:aws:s3:::{cloudtrail_bucket}/AWSLogs/*"
+                ]
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
                     "s3:PutObject"
                 ],
                 "Resource": [
-                    f"arn:aws:s3:::{MODEL_BUCKET}/*",
-                    f"arn:aws:s3:::{CLOUDTRAIL_BUCKET}/*"
+                    f"arn:aws:s3:::{cloudtrail_bucket}/anomalies/*"
                 ]
             },
             {
@@ -58,20 +67,23 @@ def create_lambda_role():
                     "s3:ListBucket"
                 ],
                 "Resource": [
-                    f"arn:aws:s3:::{MODEL_BUCKET}",
-                    f"arn:aws:s3:::{CLOUDTRAIL_BUCKET}"
+                    f"arn:aws:s3:::{model_bucket}",
+                    f"arn:aws:s3:::{cloudtrail_bucket}"
                 ]
             }
         ]
     }
     
     try:
+        iam = aws_client('iam', region)
         # Create role
-        print(f"Creating IAM role: {LAMBDA_ROLE_NAME}")
+        print(f"Creating IAM role: {lambda_role_name}")
         
         try:
-            response = iam.create_role(
-                RoleName=LAMBDA_ROLE_NAME,
+            response = safe_aws_call(
+                'create Lambda IAM role',
+                iam.create_role,
+                RoleName=lambda_role_name,
                 AssumeRolePolicyDocument=json.dumps(trust_policy),
                 Description='Role for CloudTrail anomaly detection Lambda'
             )
@@ -79,15 +91,21 @@ def create_lambda_role():
             print(f"[OK] Role created: {role_arn}")
         except ClientError as e:
             if e.response['Error']['Code'] == 'EntityAlreadyExists':
-                role_arn = iam.get_role(RoleName=LAMBDA_ROLE_NAME)['Role']['Arn']
+                role_arn = safe_aws_call(
+                    'get existing Lambda IAM role',
+                    iam.get_role,
+                    RoleName=lambda_role_name
+                )['Role']['Arn']
                 print(f"[OK] Role already exists: {role_arn}")
             else:
                 raise e
         
         # Attach inline policy
         print("Attaching permissions policy...")
-        iam.put_role_policy(
-            RoleName=LAMBDA_ROLE_NAME,
+        safe_aws_call(
+            'attach Lambda IAM inline policy',
+            iam.put_role_policy,
+            RoleName=lambda_role_name,
             PolicyName='cloudtrail-anomaly-detector-policy',
             PolicyDocument=json.dumps(permissions_policy)
         )
@@ -99,188 +117,23 @@ def create_lambda_role():
         
         return role_arn
         
-    except Exception as e:
+    except (ClientError, NoCredentialsError, PartialCredentialsError, AwsOperationError) as e:
+        LOGGER.error('IAM role setup failed: %s', e)
         print(f"[FAIL] Error creating role: {e}")
         raise
 
 
 def create_lambda_package():
-    """Create a deployment package for Lambda with dependencies."""
+    """Create a deployment package from repository runtime source."""
     print("\nCreating Lambda deployment package...")
-    
-    # Lambda function code (simplified version without sklearn for smaller package)
-    lambda_code = '''
-"""
-CloudTrail Anomaly Detection Lambda (Rule-based version)
-"""
+    lambda_source_path = 'lambda_function.py'
+    if not os.path.exists(lambda_source_path):
+        raise FileNotFoundError('lambda_function.py not found in repository root')
 
-import json
-import boto3
-import gzip
-import os
-from datetime import datetime
-from io import BytesIO
-import urllib.parse
-
-
-OUTPUT_BUCKET = os.environ.get('OUTPUT_BUCKET', 'akshit-cloudtrail-logs-4679')
-
-SUSPICIOUS_APIS = [
-    'DeleteTrail', 'StopLogging', 'UpdateTrail',
-    'DeleteBucket', 'DeleteBucketPolicy',
-    'CreateUser', 'CreateAccessKey', 'DeleteUser',
-    'AttachUserPolicy', 'AttachRolePolicy',
-    'PutBucketPolicy', 'PutBucketAcl',
-    'AuthorizeSecurityGroupIngress', 'AuthorizeSecurityGroupEgress',
-    'CreateKeyPair', 'ImportKeyPair',
-    'RunInstances', 'CreateRole', 'CreateFunction',
-    'DeleteFunction', 'UpdateFunctionCode',
-    'CreateVpc', 'DeleteVpc',
-    'CreateSecurityGroup', 'DeleteSecurityGroup'
-]
-
-
-def parse_cloudtrail_log(bucket, key):
-    s3 = boto3.client('s3')
-    
-    try:
-        response = s3.get_object(Bucket=bucket, Key=key)
-        
-        if key.endswith('.gz'):
-            with gzip.GzipFile(fileobj=BytesIO(response['Body'].read())) as f:
-                log_data = json.loads(f.read().decode('utf-8'))
-        else:
-            log_data = json.loads(response['Body'].read().decode('utf-8'))
-        
-        return log_data.get('Records', [])
-        
-    except Exception as e:
-        print(f"Error parsing log: {e}")
-        return []
-
-
-def analyze_event(event):
-    result = {
-        'eventId': event.get('eventID', 'unknown'),
-        'eventTime': event.get('eventTime', ''),
-        'eventName': event.get('eventName', ''),
-        'eventSource': event.get('eventSource', ''),
-        'sourceIPAddress': event.get('sourceIPAddress', ''),
-        'awsRegion': event.get('awsRegion', ''),
-        'userIdentity': event.get('userIdentity', {}),
-        'is_anomaly': False,
-        'anomaly_reasons': []
-    }
-    
-    api_name = event.get('eventName', '')
-    user_identity = event.get('userIdentity', {})
-    
-    # Check for suspicious APIs
-    if api_name in SUSPICIOUS_APIS:
-        result['anomaly_reasons'].append(f"Suspicious API: {api_name}")
-        result['is_anomaly'] = True
-    
-    # Check for root account
-    if user_identity.get('type') == 'Root':
-        result['anomaly_reasons'].append("Root account used")
-        result['is_anomaly'] = True
-    
-    # Check for access errors
-    error_code = event.get('errorCode', '')
-    if error_code in ['AccessDenied', 'UnauthorizedAccess', 'InvalidClientTokenId', 'SignatureDoesNotMatch']:
-        result['anomaly_reasons'].append(f"Access error: {error_code}")
-        result['is_anomaly'] = True
-    
-    # Check for unusual hours (outside 6 AM - 10 PM)
-    try:
-        event_time = event.get('eventTime', '')
-        hour = datetime.fromisoformat(event_time.replace('Z', '+00:00')).hour
-        if hour < 6 or hour > 22:
-            result['anomaly_reasons'].append(f"Unusual hour: {hour}:00 UTC")
-            result['is_anomaly'] = True
-    except:
-        pass
-    
-    # Check for console login from new IP
-    if api_name == 'ConsoleLogin':
-        result['anomaly_reasons'].append("Console login detected")
-        result['is_anomaly'] = True
-    
-    return result
-
-
-def save_anomalies(anomalies, source_key):
-    if not anomalies:
-        return
-    
-    s3 = boto3.client('s3')
-    timestamp = datetime.utcnow().strftime('%Y/%m/%d/%H')
-    filename = os.path.basename(source_key).replace('.json.gz', '_anomalies.json')
-    output_key = f"anomalies/{timestamp}/{filename}"
-    
-    output = {
-        'source_log': source_key,
-        'analyzed_at': datetime.utcnow().isoformat(),
-        'total_anomalies': len(anomalies),
-        'anomalies': anomalies
-    }
-    
-    try:
-        s3.put_object(
-            Bucket=OUTPUT_BUCKET,
-            Key=output_key,
-            Body=json.dumps(output, indent=2, default=str),
-            ContentType='application/json'
-        )
-        print(f"Saved: s3://{OUTPUT_BUCKET}/{output_key}")
-    except Exception as e:
-        print(f"Error saving: {e}")
-
-
-def lambda_handler(event, context):
-    print("CloudTrail Anomaly Detection")
-    print(f"Event: {json.dumps(event)}")
-    
-    total_events = 0
-    total_anomalies = 0
-    all_anomalies = []
-    
-    for record in event.get('Records', []):
-        bucket = record['s3']['bucket']['name']
-        key = urllib.parse.unquote_plus(record['s3']['object']['key'])
-        
-        if 'CloudTrail' not in key:
-            print(f"Skipping: {key}")
-            continue
-        
-        print(f"Processing: {key}")
-        events = parse_cloudtrail_log(bucket, key)
-        total_events += len(events)
-        
-        for ct_event in events:
-            result = analyze_event(ct_event)
-            if result['is_anomaly']:
-                total_anomalies += 1
-                all_anomalies.append(result)
-                print(f"ANOMALY: {result['eventName']} - {result['anomaly_reasons']}")
-        
-        save_anomalies(all_anomalies, key)
-    
-    print(f"Complete: {total_events} events, {total_anomalies} anomalies")
-    
-    return {
-        'statusCode': 200,
-        'body': {
-            'events_analyzed': total_events,
-            'anomalies_detected': total_anomalies
-        }
-    }
-'''
-    
     # Create zip file
     zip_path = 'lambda_package.zip'
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr('lambda_function.py', lambda_code)
+        zf.write(lambda_source_path, arcname='lambda_function.py')
     
     file_size = os.path.getsize(zip_path)
     print(f"[OK] Package created: {zip_path} ({file_size / 1024:.2f} KB)")
@@ -288,19 +141,24 @@ def lambda_handler(event, context):
     return zip_path
 
 
-def deploy_lambda_function(role_arn, zip_path):
+def deploy_lambda_function(role_arn, zip_path, lambda_function_name, model_bucket, cloudtrail_bucket, rule_only_mode, region):
     """Deploy or update the Lambda function."""
-    lambda_client = boto3.client('lambda', region_name=REGION)
-    
-    print(f"\nDeploying Lambda function: {LAMBDA_FUNCTION_NAME}")
-    
-    with open(zip_path, 'rb') as f:
-        zip_content = f.read()
+    print(f"\nDeploying Lambda function: {lambda_function_name}")
+
+    try:
+        lambda_client = aws_client('lambda', region)
+        with open(zip_path, 'rb') as f:
+            zip_content = f.read()
+    except OSError as exc:
+        LOGGER.error('Failed to read Lambda deployment package %s: %s', zip_path, exc)
+        raise
     
     try:
         # Try to create new function
-        response = lambda_client.create_function(
-            FunctionName=LAMBDA_FUNCTION_NAME,
+        response = safe_aws_call(
+            'create Lambda function',
+            lambda_client.create_function,
+            FunctionName=lambda_function_name,
             Runtime='python3.11',
             Role=role_arn,
             Handler='lambda_function.lambda_handler',
@@ -310,122 +168,211 @@ def deploy_lambda_function(role_arn, zip_path):
             MemorySize=512,
             Environment={
                 'Variables': {
-                    'MODEL_BUCKET': MODEL_BUCKET,
-                    'OUTPUT_BUCKET': CLOUDTRAIL_BUCKET
+                    'MODEL_BUCKET': model_bucket,
+                    'MODEL_KEY': 'models/cloudtrail_anomaly_model.pkl',
+                    'OUTPUT_BUCKET': cloudtrail_bucket,
+                    'RULE_ONLY_MODE': str(rule_only_mode).lower(),
                 }
             }
         )
         print(f"[OK] Lambda created: {response['FunctionArn']}")
         return response['FunctionArn']
         
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'ResourceConflictException':
+    except (ClientError, NoCredentialsError, PartialCredentialsError, AwsOperationError) as e:
+        if _aws_error_code(e) == 'ResourceConflictException':
             # Update existing function
             print("Function exists, updating...")
-            lambda_client.update_function_code(
-                FunctionName=LAMBDA_FUNCTION_NAME,
+            safe_aws_call(
+                'update Lambda function code',
+                lambda_client.update_function_code,
+                FunctionName=lambda_function_name,
                 ZipFile=zip_content
             )
-            
-            # Wait for update
-            time.sleep(5)
-            
-            lambda_client.update_function_configuration(
-                FunctionName=LAMBDA_FUNCTION_NAME,
-                Runtime='python3.11',
-                Role=role_arn,
-                Handler='lambda_function.lambda_handler',
-                Timeout=60,
-                MemorySize=512,
-                Environment={
-                    'Variables': {
-                        'MODEL_BUCKET': MODEL_BUCKET,
-                        'OUTPUT_BUCKET': CLOUDTRAIL_BUCKET
-                    }
-                }
+
+            safe_aws_call(
+                'wait for Lambda function update',
+                lambda_client.get_waiter('function_updated').wait,
+                FunctionName=lambda_function_name
+            )
+
+            for attempt in range(1, 6):
+                try:
+                    safe_aws_call(
+                        'update Lambda function configuration',
+                        lambda_client.update_function_configuration,
+                        FunctionName=lambda_function_name,
+                        Runtime='python3.11',
+                        Role=role_arn,
+                        Handler='lambda_function.lambda_handler',
+                        Timeout=60,
+                        MemorySize=512,
+                        Environment={
+                            'Variables': {
+                                'MODEL_BUCKET': model_bucket,
+                                'MODEL_KEY': 'models/cloudtrail_anomaly_model.pkl',
+                                'OUTPUT_BUCKET': cloudtrail_bucket,
+                                'RULE_ONLY_MODE': str(rule_only_mode).lower(),
+                            }
+                        }
+                    )
+                    break
+                except ClientError as inner_e:
+                    if inner_e.response['Error']['Code'] == 'ResourceConflictException' and attempt < 5:
+                        print(f"[WARN] Lambda busy, retrying configuration update ({attempt}/5)...")
+                        time.sleep(4)
+                        continue
+                    raise
+
+            safe_aws_call(
+                'wait for Lambda configuration update',
+                lambda_client.get_waiter('function_updated').wait,
+                FunctionName=lambda_function_name
             )
             
-            response = lambda_client.get_function(FunctionName=LAMBDA_FUNCTION_NAME)
+            response = safe_aws_call(
+                'fetch Lambda function details',
+                lambda_client.get_function,
+                FunctionName=lambda_function_name
+            )
             print(f"[OK] Lambda updated: {response['Configuration']['FunctionArn']}")
             return response['Configuration']['FunctionArn']
         else:
-            raise e
+            LOGGER.error('Lambda deployment failed: %s', e)
+            raise
 
 
-def setup_s3_trigger(function_arn):
+def setup_s3_trigger(function_arn, lambda_function_name, cloudtrail_bucket, region):
     """Configure S3 to trigger Lambda when CloudTrail delivers logs."""
-    lambda_client = boto3.client('lambda', region_name=REGION)
-    s3_client = boto3.client('s3', region_name=REGION)
-    account_id = boto3.client('sts').get_caller_identity()['Account']
-    
-    print(f"\nSetting up S3 trigger from {CLOUDTRAIL_BUCKET}")
+    print(f"\nSetting up S3 trigger from {cloudtrail_bucket}")
+
+    try:
+        lambda_client = aws_client('lambda', region)
+        s3_client = aws_client('s3', region)
+        account_id = safe_aws_call(
+            'resolve AWS account ID for S3 trigger',
+            aws_client('sts', region).get_caller_identity
+        )['Account']
+    except (ClientError, NoCredentialsError, PartialCredentialsError, AwsOperationError) as e:
+        LOGGER.error('Failed to initialize clients for trigger setup: %s', e)
+        print(f"[WARN] Could not initialize trigger setup clients: {e}")
+        return
     
     # Add permission for S3 to invoke Lambda
     try:
-        lambda_client.add_permission(
-            FunctionName=LAMBDA_FUNCTION_NAME,
+        safe_aws_call(
+            'add S3 invoke permission to Lambda',
+            lambda_client.add_permission,
+            FunctionName=lambda_function_name,
             StatementId='S3InvokePermission',
             Action='lambda:InvokeFunction',
             Principal='s3.amazonaws.com',
-            SourceArn=f'arn:aws:s3:::{CLOUDTRAIL_BUCKET}',
+            SourceArn=f'arn:aws:s3:::{cloudtrail_bucket}',
             SourceAccount=account_id
         )
         print("[OK] Lambda permission added for S3")
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'ResourceConflictException':
+    except (ClientError, NoCredentialsError, PartialCredentialsError, AwsOperationError) as e:
+        if _aws_error_code(e) == 'ResourceConflictException':
             print("[OK] Lambda permission already exists")
         else:
             print(f"[WARN] Could not add permission: {e}")
     
     # Configure S3 bucket notification
-    notification_config = {
-        'LambdaFunctionConfigurations': [{
-            'LambdaFunctionArn': function_arn,
-            'Events': ['s3:ObjectCreated:*'],
-            'Filter': {
-                'Key': {
-                    'FilterRules': [
-                        {'Name': 'prefix', 'Value': 'AWSLogs/'},
-                        {'Name': 'suffix', 'Value': '.json.gz'}
-                    ]
-                }
+    desired_lambda_config = {
+        'Id': 'CloudTrailInvokeLambda',
+        'LambdaFunctionArn': function_arn,
+        'Events': ['s3:ObjectCreated:*'],
+        'Filter': {
+            'Key': {
+                'FilterRules': [
+                    {'Name': 'prefix', 'Value': 'AWSLogs/'},
+                    {'Name': 'suffix', 'Value': '.json.gz'}
+                ]
             }
-        }]
+        }
     }
     
     try:
-        s3_client.put_bucket_notification_configuration(
-            Bucket=CLOUDTRAIL_BUCKET,
+        existing = safe_aws_call(
+            'get existing S3 bucket notifications',
+            s3_client.get_bucket_notification_configuration,
+            Bucket=cloudtrail_bucket
+        )
+        existing_lambda_configs = existing.get('LambdaFunctionConfigurations', [])
+        merged_lambda_configs = [
+            item for item in existing_lambda_configs if item.get('Id') != desired_lambda_config['Id']
+        ]
+        merged_lambda_configs.append(desired_lambda_config)
+
+        notification_config = {
+            'LambdaFunctionConfigurations': merged_lambda_configs
+        }
+        if existing.get('QueueConfigurations'):
+            notification_config['QueueConfigurations'] = existing.get('QueueConfigurations')
+        if existing.get('TopicConfigurations'):
+            notification_config['TopicConfigurations'] = existing.get('TopicConfigurations')
+        if existing.get('EventBridgeConfiguration'):
+            notification_config['EventBridgeConfiguration'] = existing.get('EventBridgeConfiguration')
+
+        safe_aws_call(
+            'set S3 bucket notification configuration',
+            s3_client.put_bucket_notification_configuration,
+            Bucket=cloudtrail_bucket,
             NotificationConfiguration=notification_config
         )
         print("[OK] S3 trigger configured")
-    except Exception as e:
+    except (ClientError, NoCredentialsError, PartialCredentialsError, AwsOperationError) as e:
+        LOGGER.error('S3 trigger configuration failed for bucket %s: %s', cloudtrail_bucket, e)
         print(f"[WARN] Could not configure S3 trigger: {e}")
         print("You may need to configure this manually in the AWS Console")
 
 
 def main():
     """Main deployment function."""
+    parser = argparse.ArgumentParser(description='Deploy CloudTrail anomaly detector Lambda')
+    parser.add_argument('--region', required=True, help='AWS region')
+    parser.add_argument('--cloudtrail-bucket', required=True, help='CloudTrail source bucket')
+    parser.add_argument('--model-bucket', required=True, help='Model bucket')
+    parser.add_argument('--lambda-function-name', required=True, help='Lambda function name')
+    parser.add_argument('--lambda-role-name', required=True, help='Lambda IAM role name')
+    parser.add_argument('--rule-only-mode', action='store_true', help='Deploy in rule-only mode')
+    args = parser.parse_args()
+
+    region = args.region
+    cloudtrail_bucket = args.cloudtrail_bucket
+    model_bucket = args.model_bucket
+    lambda_function_name = args.lambda_function_name
+    lambda_role_name = args.lambda_role_name
+    rule_only_mode = args.rule_only_mode
+
     print("=" * 60)
     print("CloudTrail Anomaly Detection - Lambda Deployment")
     print("=" * 60)
-    print(f"Function: {LAMBDA_FUNCTION_NAME}")
-    print(f"Region: {REGION}")
-    print(f"CloudTrail Bucket: {CLOUDTRAIL_BUCKET}")
-    print(f"Model Bucket: {MODEL_BUCKET}")
+    print(f"Function: {lambda_function_name}")
+    print(f"Region: {region}")
+    print(f"CloudTrail Bucket: {cloudtrail_bucket}")
+    print(f"Model Bucket: {model_bucket}")
+    print(f"Rule Only Mode: {rule_only_mode}")
     print("=" * 60 + "\n")
     
     # Step 1: Create IAM role
-    role_arn = create_lambda_role()
+    role_arn = create_lambda_role(lambda_role_name, model_bucket, cloudtrail_bucket, region)
     
     # Step 2: Create deployment package
     zip_path = create_lambda_package()
     
     # Step 3: Deploy Lambda
-    function_arn = deploy_lambda_function(role_arn, zip_path)
+    function_arn = deploy_lambda_function(
+        role_arn=role_arn,
+        zip_path=zip_path,
+        lambda_function_name=lambda_function_name,
+        model_bucket=model_bucket,
+        cloudtrail_bucket=cloudtrail_bucket,
+        rule_only_mode=rule_only_mode,
+        region=region,
+    )
     
     # Step 4: Setup S3 trigger
-    setup_s3_trigger(function_arn)
+    setup_s3_trigger(function_arn, lambda_function_name, cloudtrail_bucket, region)
     
     # Cleanup
     os.remove(zip_path)
@@ -434,12 +381,17 @@ def main():
     print("Lambda Deployment Complete!")
     print("=" * 60)
     print(f"Function ARN: {function_arn}")
-    print(f"Trigger: s3://{CLOUDTRAIL_BUCKET}/AWSLogs/*.json.gz")
+    print(f"Trigger: s3://{cloudtrail_bucket}/AWSLogs/*.json.gz")
     print("\nNext Steps:")
     print("1. Wait for CloudTrail to deliver logs (~15-30 min)")
     print("2. Check CloudWatch Logs for Lambda invocations")
-    print(f"3. Check s3://{CLOUDTRAIL_BUCKET}/anomalies/ for results")
+    print(f"3. Check s3://{cloudtrail_bucket}/anomalies/ for results")
 
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
+    try:
+        main()
+    except Exception as exc:
+        LOGGER.exception('Deployment failed: %s', exc)
+        raise
