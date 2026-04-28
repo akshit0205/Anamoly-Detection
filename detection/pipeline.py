@@ -21,14 +21,56 @@ REQUIRED_USER_FIELDS = (
 )
 
 
+def _get_severity(event_name: str, is_root: bool, error_code: str) -> str:
+    if is_root:
+        return 'critical'
+    if event_name in [
+        'DeleteTrail', 'StopLogging', 'UpdateTrail',
+        'DeleteUser', 'DeleteRole', 'DeletePolicy',
+        'AuthorizeSecurityGroupIngress', 'DeleteBucket'
+    ]:
+        return 'high'
+    if event_name in [
+        'CreateUser', 'CreateRole', 'AttachRolePolicy',
+        'DetachRolePolicy', 'PutRolePolicy', 'AddUserToGroup',
+        'RemoveUserFromGroup', 'AssumeRole', 'ConsoleLogin'
+    ]:
+        return 'medium'
+    if error_code == 'AccessDenied':
+        return 'low'
+    return 'low'
+
+
 def _is_sensitive_api(event_name: str) -> bool:
     sensitive = [
+        # IAM — identity threats
         'DeleteGroup', 'DeleteUser', 'DeleteRole', 'DeletePolicy',
-        'CreateUser', 'CreateRole', 'AttachRolePolicy', 'DetachRolePolicy',
-        'PutRolePolicy', 'AddUserToGroup', 'RemoveUserFromGroup',
-        'StopInstances', 'TerminateInstances', 'DeleteBucket',
-        'AssumeRole', 'ConsoleLogin', 'AuthorizeSecurityGroupIngress',
-        'DeleteTrail', 'StopLogging', 'UpdateTrail'
+        'CreateUser', 'CreateRole', 'CreateGroup',
+        'AttachRolePolicy', 'DetachRolePolicy', 'PutRolePolicy',
+        'AttachUserPolicy', 'DetachUserPolicy', 'PutUserPolicy',
+        'AttachGroupPolicy', 'DetachGroupPolicy', 'PutGroupPolicy',
+        'AddUserToGroup', 'RemoveUserFromGroup',
+        'CreateAccessKey', 'DeleteAccessKey', 'UpdateAccessKey',
+        'CreateLoginProfile', 'DeleteLoginProfile', 'UpdateLoginProfile',
+        'CreateVirtualMFADevice', 'DeactivateMFADevice', 'DeleteVirtualMFADevice',
+        # EC2 — compute threats
+        'StopInstances', 'TerminateInstances', 'RunInstances',
+        'AuthorizeSecurityGroupIngress', 'AuthorizeSecurityGroupEgress',
+        'RevokeSecurityGroupIngress', 'DeleteSecurityGroup',
+        'CreateKeyPair', 'DeleteKeyPair', 'ImportKeyPair',
+        # S3 — data threats
+        'DeleteBucket', 'DeleteBucketPolicy', 'PutBucketPolicy',
+        'PutBucketAcl', 'DeleteBucketEncryption',
+        # CloudTrail — covering tracks
+        'DeleteTrail', 'StopLogging', 'UpdateTrail',
+        'PutEventSelectors', 'DeleteEventDataStore',
+        # Auth events
+        'ConsoleLogin', 'AssumeRole',
+        # Network
+        'CreateVpc', 'DeleteVpc', 'CreateSubnet',
+        'AttachInternetGateway', 'CreateRoute',
+        # KMS
+        'DisableKey', 'ScheduleKeyDeletion', 'DeleteAlias',
     ]
     return event_name in sensitive
 
@@ -78,7 +120,6 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
         return []
 
     account_id = user['account_id']
-    print(f"DEBUG: run_detection called for account_id={account_id}", flush=True)
     role_arn = user['role_arn']
     region = user['region']
     default_bucket = user['cloudtrail_bucket']
@@ -121,7 +162,6 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                             continue
 
                         event_name = record.get('eventName', '')
-                        print(f"DEBUG: event={event_name} user={_extract_username(record)} error={record.get('errorCode')} root={(record.get('userIdentity', {}) or {}).get('type') == 'Root'}", flush=True)
                         logger.debug('EVENT_SEEN', extra={'account_id': account_id, 'event_name': event_name})
                         username = _extract_username(record)
                         timestamp = record.get('eventTime', '')
@@ -151,6 +191,7 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                                         'username': username,
                                         'reason': reason,
                                         'timestamp': timestamp,
+                                        'severity': _get_severity(event_name, is_root, error_code),
                                     }
                                 )
             else:
@@ -163,7 +204,6 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                 f"AWSLogs/{account_id}/CloudTrail/{region}/"
                 f"{today.year}/{today.month:02d}/{today.day:02d}/"
             )
-            print(f"DEBUG: scanning prefix={prefix}", flush=True)
             page_iter = paginator.paginate(
                 Bucket=default_bucket,
                 Prefix=prefix,
@@ -214,7 +254,6 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                             continue
 
                         event_name = record.get('eventName', '')
-                        print(f"DEBUG: event={event_name} user={_extract_username(record)} error={record.get('errorCode')} root={(record.get('userIdentity', {}) or {}).get('type') == 'Root'}", flush=True)
                         logger.debug('EVENT_SEEN', extra={'account_id': account_id, 'event_name': event_name})
                         username = _extract_username(record)
                         timestamp = record.get('eventTime', '')
@@ -244,10 +283,10 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                                         'username': username,
                                         'reason': reason,
                                         'timestamp': timestamp,
+                                        'severity': _get_severity(event_name, is_root, error_code),
                                     }
                                 )
                     files_processed += 1
-            print(f"DEBUG: total_objects={total_objects}", flush=True)
             logger.info('S3_LIST_COMPLETE', extra={'bucket': default_bucket, 'total_objects': total_objects})
 
     except ClientError as exc:

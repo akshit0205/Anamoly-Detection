@@ -57,6 +57,12 @@ This document gives a concise file-by-file overview of the CloudTrail Anomaly De
 - Deduplication: detection uses a dedup key (eventName:user:errorCode) to avoid duplicate alerts for the same event.
 - Environment vars required for API/Lambda: `SENDER_EMAIL` (SES verified sender) and AWS credentials or role attached to runtime.
 
+## Current system status
+
+- Severity field in output ✅
+- Debug prints cleanup ✅
+- Expanded detection rules (50+ events) ✅
+
 ## Next recommended tasks (handoff checklist)
 
 - Verify DynamoDB `users` table exists (run `storage/create_table.py`).
@@ -70,6 +76,19 @@ This document gives a concise file-by-file overview of the CloudTrail Anomaly De
 - STS logs: `auth/sts_helper.py` emits ASSUME_ROLE_START / SUCCESS / FAILED log lines.
 - Detection debug prints and structured logs in `detection/pipeline.py` (scan prefix, total_objects, per-event debug).
 - Lambda logs (CloudWatch) for `lambda/handler.py` or `lambda_function.py` when invoked by S3.
+
+## Anomaly output format example
+
+Example anomaly object saved to S3 / returned by `/run`:
+
+{
+  "account_id": "123456789012",
+  "event_name": "DeleteBucket",
+  "username": "alice",
+  "reason": "Sensitive API call detected: DeleteBucket",
+  "timestamp": "2026-04-29T12:34:56Z",
+  "severity": "high|medium|low|critical"
+}
 
 ---
 
