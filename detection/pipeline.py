@@ -20,6 +20,11 @@ REQUIRED_USER_FIELDS = (
     'email',
 )
 
+WHITELISTED_ARNS = [
+    'cloudtrail-anomaly-detector',
+    'AWSService',
+]
+
 
 def _get_severity(event_name: str, is_root: bool, error_code: str) -> str:
     if is_root:
@@ -39,6 +44,14 @@ def _get_severity(event_name: str, is_root: bool, error_code: str) -> str:
     if error_code == 'AccessDenied':
         return 'low'
     return 'low'
+
+
+def _is_whitelisted(username: str) -> bool:
+    whitelist = [
+        'cloudtrail-anomaly-detector',
+        'AWSService',
+    ]
+    return any(w in username for w in whitelist)
 
 
 def _is_sensitive_api(event_name: str) -> bool:
@@ -115,6 +128,27 @@ def _validate_user(user: dict) -> bool:
     return True
 
 
+def _save_anomalies_to_s3(s3_client, bucket: str, account_id: str, anomalies: list):
+    if not anomalies:
+        return
+    timestamp = datetime.now(timezone.utc).strftime('%Y/%m/%d/%H%M%S')
+    key = f"anomalies/{account_id}/{timestamp}.json"
+    body = json.dumps({
+        "account_id": account_id,
+        "detected_at": datetime.now(timezone.utc).isoformat(),
+        "anomalies": anomalies
+    })
+    try:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=body,
+            ContentType='application/json'
+        )
+    except Exception as e:
+        print(f"Failed to persist anomalies: {e}")
+
+
 def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
     if not _validate_user(user):
         return []
@@ -173,7 +207,7 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                         if is_root:
                             reasons.append('Root account usage detected')
                             logger.info('ANOMALY_DETECTED', extra={'account_id': account_id, 'event_name': event_name, 'rule': 'Root'})
-                        if _is_sensitive_api(event_name):
+                        if _is_sensitive_api(event_name) and not _is_whitelisted(username):
                             reasons.append(f'Sensitive API call detected: {event_name}')
                             logger.info('ANOMALY_DETECTED', extra={'account_id': account_id, 'event_name': event_name, 'rule': 'SensitiveAPI'})
                         if error_code == 'AccessDenied':
@@ -265,7 +299,7 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                         if is_root:
                             reasons.append('Root account usage detected')
                             logger.info('ANOMALY_DETECTED', extra={'account_id': account_id, 'event_name': event_name, 'rule': 'Root'})
-                        if _is_sensitive_api(event_name):
+                        if _is_sensitive_api(event_name) and not _is_whitelisted(username):
                             reasons.append(f'Sensitive API call detected: {event_name}')
                             logger.info('ANOMALY_DETECTED', extra={'account_id': account_id, 'event_name': event_name, 'rule': 'SensitiveAPI'})
                         if error_code == 'AccessDenied':
@@ -298,5 +332,7 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
         logger.error('BotoCoreError listing CloudTrail logs for bucket=%s account_id=%s: %s', default_bucket, account_id, exc)
         raise RuntimeError(f'Failed to list CloudTrail logs for bucket={default_bucket}') from exc
 
+    bucket_name = default_bucket
+    _save_anomalies_to_s3(s3_client, bucket_name, account_id, anomalies)
     logger.info('Detection complete account_id=%s anomalies=%d', account_id, len(anomalies))
     return anomalies

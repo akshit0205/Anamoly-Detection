@@ -3,6 +3,8 @@ import os
 
 import boto3
 from fastapi import FastAPI
+from fastapi import Security, HTTPException
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -21,6 +23,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+API_KEY = os.getenv("API_KEY", "dev-secret-key")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def verify_api_key(key: str = Security(api_key_header)):
+    if key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
+    return key
 
 
 def _storage_region() -> str:
@@ -72,8 +83,19 @@ def health_check():
     return {'status': 'ok'}
 
 
+@app.get("/rules/count")
+async def get_rules_count(api_key: str = Security(verify_api_key)):
+    from detection.pipeline import _is_sensitive_api
+    import inspect
+    # Count items in the sensitive list inside _is_sensitive_api
+    source = inspect.getsource(_is_sensitive_api)
+    count = source.count("'")
+    # Each event name has 2 quotes, divide by 2
+    return {"count": count // 2}
+
+
 @app.post('/run/{account_id}')
-def run_for_user(account_id: str):
+async def run_for_user(account_id: str, api_key: str = Security(verify_api_key)):
     try:
         user = get_user(account_id, _storage_region())
         if not user:
