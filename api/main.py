@@ -87,7 +87,11 @@ def run_for_user(account_id: str):
         anomalies = run_detection(user)
         dispatch_alerts(anomalies, user, sender_email)
 
-        return {'account_id': account_id, 'anomalies_found': len(anomalies)}
+        return {
+            "account_id": account_id,
+            "anomalies_found": len(anomalies),
+            "anomalies": anomalies
+        }
     except Exception:
         logger.exception('Unexpected error in /run/%s', account_id)
         return JSONResponse(status_code=500, content={'error': 'Internal server error'})

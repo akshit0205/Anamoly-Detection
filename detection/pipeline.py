@@ -19,6 +19,24 @@ REQUIRED_USER_FIELDS = (
     'output_bucket',
     'email',
 )
+def _get_severity(event_name: str, is_root: bool, error_code: str) -> str:
+    if is_root:
+        return 'critical'
+    if event_name in [
+        'DeleteTrail', 'StopLogging', 'UpdateTrail',
+        'DeleteUser', 'DeleteRole', 'DeletePolicy',
+        'AuthorizeSecurityGroupIngress', 'DeleteBucket'
+    ]:
+        return 'high'
+    if event_name in [
+        'CreateUser', 'CreateRole', 'AttachRolePolicy',
+        'DetachRolePolicy', 'PutRolePolicy', 'AddUserToGroup',
+        'RemoveUserFromGroup', 'AssumeRole', 'ConsoleLogin'
+    ]:
+        return 'medium'
+    if error_code == 'AccessDenied':
+        return 'low'
+    return 'low'
 
 
 def _is_sensitive_api(event_name: str) -> bool:
@@ -78,7 +96,6 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
         return []
 
     account_id = user['account_id']
-    print(f"DEBUG: run_detection called for account_id={account_id}", flush=True)
     role_arn = user['role_arn']
     region = user['region']
     default_bucket = user['cloudtrail_bucket']
@@ -121,7 +138,6 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                             continue
 
                         event_name = record.get('eventName', '')
-                        print(f"DEBUG: event={event_name} user={_extract_username(record)} error={record.get('errorCode')} root={(record.get('userIdentity', {}) or {}).get('type') == 'Root'}", flush=True)
                         logger.debug('EVENT_SEEN', extra={'account_id': account_id, 'event_name': event_name})
                         username = _extract_username(record)
                         timestamp = record.get('eventTime', '')
@@ -151,6 +167,7 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                                         'username': username,
                                         'reason': reason,
                                         'timestamp': timestamp,
+                                        'severity': _get_severity(event_name, is_root, error_code),
                                     }
                                 )
             else:
@@ -163,7 +180,7 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                 f"AWSLogs/{account_id}/CloudTrail/{region}/"
                 f"{today.year}/{today.month:02d}/{today.day:02d}/"
             )
-            print(f"DEBUG: scanning prefix={prefix}", flush=True)
+            
             page_iter = paginator.paginate(
                 Bucket=default_bucket,
                 Prefix=prefix,
@@ -213,8 +230,7 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                         if not isinstance(record, dict):
                             continue
 
-                        event_name = record.get('eventName', '')
-                        print(f"DEBUG: event={event_name} user={_extract_username(record)} error={record.get('errorCode')} root={(record.get('userIdentity', {}) or {}).get('type') == 'Root'}", flush=True)
+                            event_name = record.get('eventName', '')
                         logger.debug('EVENT_SEEN', extra={'account_id': account_id, 'event_name': event_name})
                         username = _extract_username(record)
                         timestamp = record.get('eventTime', '')
@@ -244,10 +260,11 @@ def run_detection(user: dict, bucket=None, key=None) -> list[dict]:
                                         'username': username,
                                         'reason': reason,
                                         'timestamp': timestamp,
+                                        'severity': _get_severity(event_name, is_root, error_code),
                                     }
                                 )
                     files_processed += 1
-            print(f"DEBUG: total_objects={total_objects}", flush=True)
+            
             logger.info('S3_LIST_COMPLETE', extra={'bucket': default_bucket, 'total_objects': total_objects})
 
     except ClientError as exc:
